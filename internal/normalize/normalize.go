@@ -19,11 +19,8 @@ var (
 )
 
 // Canonicalize turns raw `arguments` JSON into a deterministic byte
-// form: keys sorted, whitespace and retry noise collapsed, volatile
-// substrings masked (see masks.go).
-//
-// Malformed input still needs to produce some deterministic key, so it
-// falls back to cleaning the raw bytes as a string instead of erroring.
+// form: keys sorted, noise collapsed, volatile substrings masked
+// (masks.go). Malformed input falls back to cleaning the raw bytes.
 func Canonicalize(raw []byte) []byte {
 	var v any
 	if err := json.Unmarshal(raw, &v); err != nil {

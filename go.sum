@@ -1,2 +1,4 @@
 github.com/shyam-s00/epochsketch v0.1.0 h1:ADN1SsjEM0bqsBhiy3nkxCwVuJF5ZRPZynJYn1f6kGw=
 github.com/shyam-s00/epochsketch v0.1.0/go.mod h1:+nFcmy4t68geJP1PWXQ1jdP8N9zjpg7tL4QO/C7ta5M=
+go.yaml.in/yaml/v4 v4.0.0-rc.6 h1:1h7H1ohdUh93/FyE4YaDa1Zh64K6VVbjF4K6WUxMtH4=
+go.yaml.in/yaml/v4 v4.0.0-rc.6/go.mod h1:aZqd9kCMsGL7AuUv/m/PvWLdg5sjJsZ4oHDEnfPPfY0=

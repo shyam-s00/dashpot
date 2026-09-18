@@ -37,12 +37,9 @@ func NewScanner(r io.Reader) *Scanner {
 	}
 }
 
-// Scan reads the next line, without its trailing '\n'. Returns io.EOF
-// at end of stream. The result aliases the internal buffer and is only
-// valid until the next call — copy it to retain it.
-//
-// A line over MaxLineSize is drained and forwarded to rawOut (may be
-// nil) instead of buffered, returning ErrLineTooLong.
+// Scan reads the next line (result valid until the next call). Returns
+// io.EOF at end of stream, or ErrLineTooLong for a line over MaxLineSize
+// (drained and forwarded to rawOut, which may be nil).
 func (s *Scanner) Scan(rawOut io.Writer) (line []byte, err error) {
 	s.line = s.line[:0]
 	for {
