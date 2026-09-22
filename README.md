@@ -1,164 +1,213 @@
-# Dashpot: High-Level Specification & Architecture Roadmap
+# Dashpot
 
-**A Zero-Overhead Runtime Governor and Policy Sidecar for Autonomous AI Agent Workloads**
+**A small, fixed-memory proxy that stops an unattended AI agent from looping on its tools.**
 
----
-
-## 1. Project Purpose & Vision
-
-### 1.1 The Problem
-Autonomous AI agents are increasingly deployed in headless backend environments—executing multi-step software engineering tasks, infrastructure remediation, data processing, and batch operations inside ephemeral containers and virtualized sandboxes.
-
-Unlike interactive developer tooling where a human engineer observes the terminal and can manually intervene, headless agent pipelines operate unattended. In these unconstrained environments, agent loops present critical operational and financial liabilities:
-- **Velocity Thrash & API Lockouts:** An agent encountering a persistent failure or polling a long-running background task often enters a rapid, tight execution loop. This burns tokens, pollutes model context windows, and triggers aggressive rate limits or account bans from third-party APIs.
-- **Unbounded Blast Radius:** An autonomous agent equipped with shell, database, or cloud management tools can hallucinate destructive actions—such as recursive directory deletions, forced repository rewrites, or database drops—with zero human oversight.
-- **Runaway Resource Consumption:** Without strict out-of-band ceilings, an agent caught in an unresolvable state can cycle indefinitely, consuming infrastructure capacity and cloud budgets before failure is detected.
-
-### 1.2 The Solution
-**Dashpot** is a lightweight, single-binary runtime governor that sits as a transparent sidecar or process wrapper between an autonomous agent client and its tools (operating over the Model Context Protocol, or MCP). 
-
-Drawing its name from the mechanical dashpot—a viscous damper that absorbs kinetic energy and resists motion proportionally to velocity—Dashpot stabilizes unstable agent execution loops:
-1. **Viscous Damping:** Smooths bursty, high-frequency tool invocations by introducing progressive micro-delays rather than abruptly terminating valid operations.
-2. **Blast-Radius Firewalling:** Intercepts known destructive commands and confinement violations before tool execution occurs.
-3. **Deterministic Hard Stops:** Enforces session-level resource and invocation caps, providing structured synthetic feedback that guides the agent to summarize and terminate gracefully.
+Dashpot wraps a stdio [MCP](https://modelcontextprotocol.io) server and sits between an agent
+and its tools. It watches every tool call, recognizes when the same call is being repeated in
+a tight loop, and steps in before that loop burns tokens, floods the tool server, or runs
+unsupervised all night. It's one small static binary: no gateway to run, no SDK to adopt. You
+change the `command` of a server entry in your MCP config, and that's it.
 
 ---
 
-## 2. Core Architectural Principles
+## Why
 
-Dashpot adheres to strict systems and performance guarantees designed for high-density production environments:
+When a person watches an agent, a stuck tool call costs a few seconds: they notice and press
+Ctrl+C. When nobody is watching — CI jobs, batch pipelines, scheduled agents, containers left
+running overnight — the same failure compounds instead:
 
-- **Zero-Dependency Single Binary:** Written in pure Go with zero C-bindings or heavyweight external runtimes. Dashpot compiles into a compact, statically linked binary suitable for minimal container base images (`scratch` or `alpine`).
-- **Bounded Resource Footprint:** Memory consumption is strictly capped at initialization using fixed-size probabilistic tracking structures and pooled I/O buffers. Memory does not grow with session length, tool variety, or invocation volume.
-- **Zero-Idle Overhead:** Dynamic temporal decay is evaluated intrinsically at observation time. Dashpot runs zero background reaper tickers or maintenance goroutines when idle.
-- **Microsecond Pass-Through Latency:** Hot-path inspections (frame scanning, argument normalization, security checks, and velocity observation) execute in the microsecond range, introducing negligible overhead relative to tool execution and model inference.
-- **Fail-Open Wire Resilience:** If an unexpected parsing error or internal panic occurs, Dashpot logs the diagnostic and fails open—transparently forwarding the raw payload to ensure the governor itself never becomes an accidental point of failure.
+- The agent retries the same failing call over and over, or bounces between two calls, with
+  no one there to interrupt it.
+- A polling loop with no sleep tool checks a job's status every second, hammering the
+  upstream API the whole time.
+- Nothing bounds how long this goes on, so it runs until someone notices the bill or the logs.
+
+Dashpot exists to catch that one failure mode reliably, without getting in the way of normal
+tool use.
+
+### The name
+
+A dashpot is a mechanical damper whose resistance grows with velocity: slow, deliberate motion
+meets almost no resistance, while sudden high-speed motion meets a lot. That's the shape of the
+behavior here — normal tool use passes straight through, and only a rapid, repeating pattern
+gets stopped.
 
 ---
 
-## 3. System Architecture & The Three-Valve Model
-
-Dashpot inspects line-delimited JSON-RPC frames over standard I/O (or local domain sockets). While non-tool methods (handshakes, notifications, schema queries) stream through instantaneously, every tool execution request passes through a sequential three-valve governance pipeline:
+## How it works
 
 ```
-                      ┌─────────────────────────────────────────┐
-                      │        Autonomous Agent Runner          │
-                      └────────────────────┬────────────────────┘
-                                           │ JSON-RPC (tools/call)
-                                           ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                              DASHPOT RUNTIME GOVERNOR                                  │
-│                                                                                        │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ 1. Frame Scanner & Argument Canonicalizer                                        │  │
-│  │    Normalizes whitespace, key ordering, and dynamic noise tokens                 │  │
-│  └───────────────────────────────────────┬──────────────────────────────────────────┘  │
-│                                          ▼                                             │
-│  ┌──────────────────────────────────────────────────────────────────────────────────┐  │
-│  │ VALVE 1: BLAST-RADIUS & SECURITY GATE                                            │  │
-│  │ Matches destructive signatures, sandbox escapes, and metadata SSRF requests      │  │
-│  └───────────────────┬──────────────────────────────────────────┬───────────────────┘  │
-│                      │ Passed                                   │ Denied               │
-│                      ▼                                          ▼                      │
-│  ┌──────────────────────────────────────────────────┐  ┌────────────────────────────┐  │
-│  │ VALVE 2: SESSION BUDGET & CEILING REGULATOR      │  │ SYNTHETIC POLICY REFLEX    │  │
-│  │ Verifies cumulative calls and duration limits    │  │ Structured intercept reply │  │
-│  └───────────────────┬──────────────────────────────┘  └─────────────┬──────────────┘  │
-│                      │ Within Budget                                 │                 │
-│                      ▼                                               │                 │
-│  ┌──────────────────────────────────────────────────┐                │                 │
-│  │ VALVE 3: KINETIC VELOCITY DAMPER                 │                │                 │
-│  │ Computes instantaneous velocity via decay sketch │                │                 │
-│  │ - Low: Immediate pass-through                    │                │                 │
-│  │ - Medium: Injects progressive micro-backoff      │                │                 │
-│  │ - High: Emits cognitive reflex warning           │                │                 │
-│  └───────────────────┬──────────────────────────────┘                │                 │
-│                      │ Forward                                       │                 │
-│                      ▼                                               │                 │
-│  ┌──────────────────────────────────────────────────┐                │                 │
-│  │ FLIGHT RECORDER & TELEMETRY                      │                │                 │
-│  │ Streams structured JSONL event records to stderr │                │                 │
-│  └───────────────────┬──────────────────────────────┘                │                 │
-└──────────────────────┼───────────────────────────────────────────────┼─────────────────┘
-                       │ Raw Passthrough                               │ Synthetic Reply
-                       ▼                                               ▼
-┌─────────────────────────────────────────────┐       ┌──────────────────────────────────┐
-│ Upstream MCP Tool Server                    │       │ Agent Context Stream             │
-│ (Bash, Filesystem, Database, Git, Cloud CLI)│       │ (Ingests feedback as tool output)│
-└─────────────────────────────────────────────┘       └──────────────────────────────────┘
+   agent (spawns MCP servers from its config)
+        |   JSON-RPC lines over stdio
+        v
+   +-------------------------------------------------------+
+   |  dashpot mcp-proxy [flags] -- <real MCP server>       |
+   |                                                       |
+   |  request path:   decide per tools/call                |
+   |                  forward, or reply instead              |
+   |  response path:  streamed through untouched            |
+   +---------------------------+---------------------------+
+                               |   stdio (supervised child)
+                               v
+                     the real MCP server
 ```
 
-### 3.1 Valve 1: Blast-Radius & Security Gate
-Evaluates tool arguments in single-pass microsecond time before execution.
-- **Destructive Command Blocking:** Denies irreversible shell and data manipulation patterns (e.g., recursive root deletions, force-pushes to version control, table drops).
-- **Filesystem Boundary Confinement:** Prevents path traversal outside designated workspace mounts.
-- **Instance Metadata & SSRF Shielding:** Blocks network tools from accessing cloud provider metadata services (e.g., link-local addresses).
-- **Feedback Mechanism:** When blocked, Dashpot synthesizes a structured tool result describing the policy violation, allowing the agent to formulate an alternative non-destructive approach without crashing the harness.
+One Dashpot process wraps one server for the life of one session.
 
-### 3.2 Valve 2: Session Budget & Ceiling Regulator
-Provides hard bounds on autonomous workloads to eliminate unbounded execution.
-- **Call Volume Ceilings:** Enforces a maximum number of cumulative tool invocations per session.
-- **Session Duration Ceilings:** Enforces wall-clock execution deadlines.
-- **Graceful Termination:** Upon reaching a ceiling, Dashpot synthesizes a final warning instructing the agent to complete its summary and conclude the task, allowing clean pod shutdown.
+**Request path.** Only `tools/call` requests are inspected; `initialize`, `tools/list`,
+notifications and everything else pass straight through. For each tool call, Dashpot decodes
+the tool name and arguments, builds a canonical key from them, and checks a fixed-memory
+frequency counter. Most calls are forwarded unchanged, byte for byte. A call is answered
+by Dashpot itself, instead of being forwarded, only once it has clearly been repeated too many
+times too quickly. This decision takes microseconds — negligible next to the milliseconds to
+seconds a real tool call takes.
 
-### 3.3 Valve 3: Kinetic Velocity Damper
-Tracks the recency and frequency of tool-call patterns using a decaying sub-linear memory sketch.
-- **Tier 1 (Normal Cadence):** Operations execute with zero artificial delay.
-- **Tier 2 (Progressive Damping):** High-frequency retries or status polling encounter calculated micro-delays (e.g., progressive exponential backoff). The tool call succeeds, but the pipeline is rhythmically paced to prevent downstream rate-limiting.
-- **Tier 3 (Reflex Circuit Break):** If an identical pattern repeats at high velocity without progress, Dashpot intercepts the call and delivers a cognitive reflection prompt advising the model to stop retrying and reconsider its hypothesis.
+**Response path.** Responses stream from the server back to the agent as-is. Dashpot never
+parses, decodes or rewrites a response body, so a large file read or a big search result costs
+nothing extra to pass through.
 
-### 3.4 The Flight Recorder (Structured Telemetry)
-Dashpot writes compact, single-line JSONL events to standard error or a dedicated logging socket. Each record captures the timestamp, tool name, execution latency, velocity metric, and the governor action taken (passed, damped, or intercepted). This stream integrates directly with container log collectors (e.g., FluentBit, Vector, Datadog) for cluster-wide auditability.
+**The repeat key.** Raw arguments are canonicalized before comparison, so cosmetic differences
+don't hide a real repeat: object keys are sorted, whitespace is collapsed, trailing retry
+annotations like `# retry` are stripped, and volatile values — UUIDs, timestamps, hex tokens,
+temp-file paths — are masked out. `grep foo  src` and `grep foo src` become the same call, and
+so do two otherwise-identical calls that only differ by a timestamp or a temp path.
+
+**The frequency counter.** Repeat counts live in
+[EpochSketch](https://github.com/shyam-s00/epochsketch), a fixed-size (about 512 KiB), decaying
+frequency sketch. Decay is computed the moment a key is read, not on a timer, so there's no
+background work and no growth in memory with session length or the number of distinct calls
+seen. Each tick of silence halves a key's count, so a call repeated slowly is forgiven while a
+rapid burst is not.
+
+**Fail open.** If Dashpot hits an internal error while making a decision, it logs the error and
+forwards the call rather than blocking it. It also logs, rather than silently allowing, the two
+edge cases it doesn't fully inspect today: a JSON-RPC batch request, and a single request line
+over 1 MiB. Both are still forwarded unchanged either way — the fix was making that visible,
+not changing the behavior — so the proxy is never the reason a session breaks.
 
 ---
 
-## 4. Supported Deployment Modalities
+## What it does
 
-Dashpot is designed to deploy seamlessly across standard container and virtualization environments without requiring SDK integrations or modifications to agent application code:
-
-1. **Kubernetes Sidecar Container:**
-   Deploys alongside the agent or tool container within a Kubernetes Pod. Intercepts traffic via shared Unix domain sockets or standard IPC.
-2. **Ephemeral MicroVM Process Wrapper:**
-   Acts as the parent supervisor inside isolated micro-virtual machines (e.g., Firecracker, cloud container instances). Spawns the tool server as a supervised child process:
-   ```sh
-   dashpot mcp-proxy --max-calls 50 -- /usr/local/bin/mcp-server
-   ```
-3. **Multi-Server Gateway (Local Proxy):**
-   Aggregates multiple underlying tool servers behind a unified governance layer, standardizing access control across heterogeneous tool providers.
-
----
-
-## 5. Architectural Roadmap
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                                   DASHPOT ROADMAP                                      │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  Phase 1: Kinetic Damper & Core Hardening                                              │
-│  - Core streaming JSON-RPC frame proxy with subprocess lifecycle supervision.          │
-│  - Fixed-memory decaying velocity sketch with intrinsic temporal decay.                │
-│  - Progressive viscous micro-delay injection on high-velocity polling.                 │
-│  - Argument canonicalization (normalizing quotes, flag order, volatile noise tokens).  │
-│  - Rapid alternating cycle detection (fixed-size circular key history).                │
-│  - Session tool-call volume ceiling with clean exit sequencing.                        │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  Phase 2: Blast-Radius Firewall & Structured Telemetry                                 │
-│  - Declarative policy engine (configurable pattern deny-lists via YAML or env).        │
-│  - Filesystem scratch confinement checks and metadata SSRF protection.                 │
-│  - High-performance JSONL audit stream (Flight Recorder) for container log ingestion.  │
-│  - Context-aware cognitive reflex prompts (differentiating status polling vs actions). │
-│  - Standardized container packaging and Kubernetes sidecar deployment manifests.      │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│  Phase 3: Multi-Server Gateway & Enterprise Governance                                 │
-│  - Gateway mode: multiplexing multiple upstream MCP servers behind one governor.       │
-│  - OpenTelemetry native metrics and distributed trace context propagation.             │
-│  - Estimated session budget/cost tracking and enforcement.                             │
-│  - Zero-parsing streaming response hashing for automated output progress detection.   │
-└────────────────────────────────────────────────────────────────────────────────────────┘
-```
+| Capability | Details |
+| :--- | :--- |
+| Repeat / loop detection | Trips when the decayed repeat count for a canonicalized tool call reaches a threshold (default: 4 times within a 10s decay window) |
+| Synthetic reply on trip | The repeated call is not forwarded. The agent instead gets a normal, well-formed tool result (`isError: false`) telling it plainly to stop repeating and try a different approach |
+| Argument canonicalization | Whitespace, key order, retry comments, UUIDs, timestamps, hex tokens and temp paths are normalized away before comparing calls |
+| Per-tool control | An allow list of tools that skip detection entirely (e.g. legitimate status polling), plus per-tool threshold overrides |
+| Config file | Optional `.dashpot.yaml` for defaults; CLI flags override it |
+| Child process supervision | Starts the real MCP server as a child, forwards its stderr untouched, relays SIGINT/SIGTERM to it (SIGTERM, then SIGKILL after a 2s grace period), and exits with the child's own exit code |
+| Clean disconnect | When the agent closes its side of stdin, Dashpot closes the child's stdin too and lets it finish on its own |
+| Visible bypass paths | Batch requests, oversized lines, and any recovered internal error are logged to stderr instead of passing silently |
 
 ---
 
-## 6. Summary
+## Quick start
 
-Dashpot bridges the critical gap between powerful autonomous models and safe production infrastructure. By combining the physical principles of kinetic damping with deterministic blast-radius gating and strict resource ceilings, Dashpot provides the missing operational safety harness required to run autonomous AI agents at enterprise scale.
+Requires Go 1.27 or newer.
+
+```sh
+git clone https://github.com/shyam-s00/dashpot
+cd dashpot
+make build          # writes bin/dashpot
+```
+
+Wrap any stdio MCP server by putting `dashpot mcp-proxy [flags] --` in front of its command:
+
+```sh
+bin/dashpot mcp-proxy -- npx -y @modelcontextprotocol/server-filesystem /workspace
+```
+
+In an MCP client config, the same thing looks like:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "/usr/local/bin/dashpot",
+      "args": ["mcp-proxy", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+    }
+  }
+}
+```
+
+### Flags
+
+| Flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `-threshold` | `4` | Decayed repeat count at which a call is intercepted |
+| `-tick-duration` | `10s` | Decay interval; the count halves each tick |
+| `-allow-tools` | none | Comma-separated tool names that skip detection |
+| `-config` | `./.dashpot.yaml` | Path to a config file |
+
+### Config file
+
+```yaml
+threshold: 4
+tick_duration: 10s
+allow_tools:
+  - get_job_status        # legitimate polling
+tool_thresholds:
+  search: 8               # searching repeatedly is often fine
+  run_tests: 6
+```
+
+A missing file is not an error. CLI flags take precedence over the file for `threshold`,
+`tick_duration` and `allow_tools`; `tool_thresholds` is file-only.
+
+---
+
+## Limitations and non-goals
+
+- **Not a security or policy tool.** Dashpot does not decide whether a tool call is safe or
+  allowed, and it does not sandbox anything. It only reacts to repetition. Pair it with a
+  dedicated MCP policy proxy, container isolation and least-privilege credentials if you need
+  those.
+- **Only what passes through it.** It governs `tools/call` traffic over stdio. An agent's
+  built-in, non-MCP tools are invisible to it, and remote MCP servers over HTTP aren't
+  supported.
+- **No cost tracking.** It never sees LLM/model traffic, so it has no notion of tokens or
+  dollars — only tool-call frequency.
+- **Frequency-based, not intent-based.** It can't tell a legitimate rapid poll from a stuck
+  loop except by rate. Use the allow list and per-tool thresholds for tools that are meant to
+  be called often.
+
+---
+
+## Design principles
+
+- **Fixed memory.** The frequency sketch and I/O buffers are sized once at startup; memory
+  doesn't grow with session length or the number of distinct calls seen.
+- **No idle work.** No polling loops or background sweeps; decay is computed at read time.
+- **Responses are never decoded.** The response path is a raw, unbuffered copy.
+- **Explicit over clever.** Which tools skip detection, or use a different threshold, is
+  something you declare — never guessed from a tool's name.
+- **Fail open.** An internal error is logged and the call is forwarded; Dashpot cannot become
+  the reason a session breaks.
+
+### Design targets
+
+| Target | Value |
+| :--- | :--- |
+| Resident memory | about 10 MiB or less at steady state |
+| Idle CPU | none |
+| Decision latency | tens of microseconds |
+| Binary size | under 12 MiB (about 5 MiB as built today) |
+
+---
+
+## Development
+
+```sh
+make build       # build bin/dashpot
+make check       # gofmt, go vet, tests with the race detector
+make test-e2e    # end-to-end suite: mock client -> dashpot -> mock server
+```
+
+The code is organized by concern: `internal/mcp` (the line protocol), `internal/normalize`
+(canonical keys), `internal/reflex` (the sketch-backed decision), `internal/proxy` (per-request
+routing), `internal/supervisor` (child process lifecycle) and `internal/config`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

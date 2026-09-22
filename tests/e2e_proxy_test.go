@@ -153,6 +153,6 @@ func genLines(n, keyspace int) string {
 // discarding output — the steady-state shape Dashpot actually runs in
 // production, not one Proxy per request.
 func runLines(engine *reflex.Engine, input string) {
-	p := proxy.New(engine, strings.NewReader(input), io.Discard, io.Discard)
+	p := proxy.New(engine, strings.NewReader(input), io.Discard, io.Discard, io.Discard)
 	_ = p.Run()
 }

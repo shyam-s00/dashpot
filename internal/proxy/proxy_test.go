@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func TestProxy_PassesNonToolCallsThrough(t *testing.T) {
 	const line = `{"jsonrpc":"2.0","id":1,"method":"initialize"}` + "\n"
 	var childIn, out bytes.Buffer
 
-	p := New(newTestEngine(4), strings.NewReader(line), &childIn, &out)
+	p := New(newTestEngine(4), strings.NewReader(line), &childIn, &out, io.Discard)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -38,7 +39,7 @@ func TestProxy_TripsOnRepeatedToolCall(t *testing.T) {
 	}
 	var childIn, out bytes.Buffer
 
-	p := New(newTestEngine(4), strings.NewReader(input.String()), &childIn, &out)
+	p := New(newTestEngine(4), strings.NewReader(input.String()), &childIn, &out, io.Discard)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -58,7 +59,7 @@ func TestProxy_MalformedLinePassesThrough(t *testing.T) {
 	const line = "not json at all\n"
 	var childIn, out bytes.Buffer
 
-	p := New(newTestEngine(4), strings.NewReader(line), &childIn, &out)
+	p := New(newTestEngine(4), strings.NewReader(line), &childIn, &out, io.Discard)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -71,9 +72,9 @@ func TestProxy_OversizedLineForwardsRawAndContinues(t *testing.T) {
 	oversized := strings.Repeat("y", 1024*1024+10)
 	const normalFmt = `{"jsonrpc":"2.0","id":1,"method":"initialize"}` + "\n"
 	input := oversized + "\n" + normalFmt
-	var childIn, out bytes.Buffer
+	var childIn, out, logs bytes.Buffer
 
-	p := New(newTestEngine(4), strings.NewReader(input), &childIn, &out)
+	p := New(newTestEngine(4), strings.NewReader(input), &childIn, &out, &logs)
 	if err := p.Run(); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -82,5 +83,24 @@ func TestProxy_OversizedLineForwardsRawAndContinues(t *testing.T) {
 	}
 	if !strings.HasSuffix(childIn.String(), normalFmt) {
 		t.Error("scanning should resume normally after the oversized line")
+	}
+	if !strings.Contains(logs.String(), "without inspection") {
+		t.Errorf("expected a log line about the unfollowed oversized line, got %q", logs.String())
+	}
+}
+
+func TestProxy_BatchRequestForwardsRawAndLogs(t *testing.T) {
+	const batch = `[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{}}}]` + "\n"
+	var childIn, out, logs bytes.Buffer
+
+	p := New(newTestEngine(4), strings.NewReader(batch), &childIn, &out, &logs)
+	if err := p.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if childIn.String() != batch {
+		t.Errorf("batch request should forward unchanged, got %q", childIn.String())
+	}
+	if !strings.Contains(logs.String(), "batch") {
+		t.Errorf("expected a log line about the unfollowed batch request, got %q", logs.String())
 	}
 }

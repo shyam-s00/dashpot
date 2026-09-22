@@ -115,7 +115,7 @@ func runProxy(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}, exempt)
 
 	out := &syncWriter{w: stdout}
-	p := proxy.New(engine, stdin, proc.Stdin(), out)
+	p := proxy.New(engine, stdin, proc.Stdin(), out, stderr)
 
 	clientErr := make(chan error, 1)
 	go func() { clientErr <- p.Run() }()
